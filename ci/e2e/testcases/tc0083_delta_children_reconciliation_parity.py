@@ -308,7 +308,7 @@ class TestCase0083DeltaChildrenReconciliationParity(MonitorModeTestCaseBase):
                 fail("receiver or independent remote manifest differs from expected moved tree")
                 continue
             if not force_children:
-                # Native /delta must still identify every online deletion while retaining the local copy.
+                # Native /delta must still identify every online file deletion while retaining the local copy.
                 reconcile_output = phase_files["subject_reconcile"][0].read_text(encoding="utf-8", errors="replace")
                 unidentified = [
                     relative for relative in deleted_files
