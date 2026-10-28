@@ -23,8 +23,11 @@ class TestCase0083DeltaChildrenReconciliationParity(MonitorModeTestCaseBase):
 
     The same reconciliation pass also receives genuine online deletions and a
     genuine online content modification from the independent mutator, beside an
-    untouched control tree. Both modes must apply the changes, leave the control
-    tree and its database records intact, and converge without feedback.
+    untouched control tree. Both modes must apply the modification, leave the
+    control tree and its database records intact, and converge without feedback.
+    The receiver runs --download-only, so native /delta identifies the online
+    deletions but deliberately retains the local copies and their records, while
+    the generated /children response applies them through its syncStatus sweep.
     """
 
     case_id = "0083"
@@ -113,6 +116,10 @@ class TestCase0083DeltaChildrenReconciliationParity(MonitorModeTestCaseBase):
                 expected_xlsx, large_xlsx_relative(expected_xlsx), survivor, destination_anchor,
                 *control_manifest,
             ])
+            # A --download-only receiver using native /delta does not delete local data for
+            # online deletions (only --cleanup-local-files would), so it retains these paths.
+            deleted_manifest = [*deleted_files, f"{deleted_directories[0]}/", f"{deleted_directories[1]}/", f"{root_name}/control/mutable/RemoveTree/Deep/"]
+            subject_expected_manifest = expected_manifest if force_children else sorted([*expected_manifest, *deleted_manifest])
 
             # The subject must NOT use --single-directory: that option itself
             # selects /children, masking any difference between these modes.
@@ -296,9 +303,20 @@ class TestCase0083DeltaChildrenReconciliationParity(MonitorModeTestCaseBase):
             write_manifest(scenario_state / "verify_manifest.txt", verify_manifest)
             scenario_details["subject_manifest"] = subject_manifest
             scenario_details["verify_manifest"] = verify_manifest
-            if subject_manifest != expected_manifest or verify_manifest != expected_manifest:
+            scenario_details["online_deleted_manifest"] = sorted(deleted_manifest)
+            if subject_manifest != subject_expected_manifest or verify_manifest != expected_manifest:
                 fail("receiver or independent remote manifest differs from expected moved tree")
                 continue
+            if not force_children:
+                # Native /delta must still identify every online deletion while retaining the local copy.
+                reconcile_output = phase_files["subject_reconcile"][0].read_text(encoding="utf-8", errors="replace")
+                unidentified = [
+                    relative for relative in deleted_files
+                    if f"Skipping local deletion for file {relative}" not in reconcile_output
+                ]
+                if unidentified:
+                    scenario_details["online_deletions_not_identified"] = unidentified
+                    fail("native /delta did not identify the online deletions for the download-only receiver")
             for root in (subject_root, verify_root):
                 for relative, content in expected_files.items():
                     if (root / relative).read_text(encoding="utf-8") != content:
@@ -308,7 +326,7 @@ class TestCase0083DeltaChildrenReconciliationParity(MonitorModeTestCaseBase):
                 if (root / source_relative).exists():
                     fail(f"stale source directory in {root.name}")
                 present_deleted = [relative for relative in deleted_paths if (root / relative).exists()]
-                if present_deleted:
+                if present_deleted and (force_children or root is verify_root):
                     scenario_details[f"{root.name}_deleted_paths_still_present"] = present_deleted
                     fail(f"online deletions were not applied in {root.name}")
                 if any("safeBackup" in p.name or ".partial" in p.name for p in root.rglob("*")):
@@ -350,13 +368,18 @@ class TestCase0083DeltaChildrenReconciliationParity(MonitorModeTestCaseBase):
             if records:
                 missing_records = [path for path in (*stable_files, mutable_survivor, changed_file, destination_relative) if path not in records]
                 lingering_records = [path for path in deleted_paths if path in records]
+                untracked_retained = [path for path in deleted_paths if path not in records]
                 out_of_sync = sorted(path for path, record in records.items() if record["syncStatus"] != "Y")
                 if missing_records:
                     scenario_details["database_missing_records"] = missing_records
                     fail("records for untouched or moved items are missing from the receiver database")
-                if lingering_records:
+                if force_children and lingering_records:
                     scenario_details["database_lingering_records"] = lingering_records
                     fail("records for items deleted online remain in the receiver database")
+                if not force_children and untracked_retained:
+                    # The retained local copies must stay tracked rather than become untracked local data.
+                    scenario_details["database_untracked_retained_records"] = untracked_retained
+                    fail("records for the local copies retained after online deletion are missing from the receiver database")
                 if out_of_sync:
                     scenario_details["database_out_of_sync_records"] = out_of_sync
                     fail("receiver database records were left flagged as out-of-sync after convergence")
@@ -373,8 +396,12 @@ class TestCase0083DeltaChildrenReconciliationParity(MonitorModeTestCaseBase):
         if len(details["executed_scenarios"]) == 2:
             left = details["CH-0001"].get("subject_manifest")
             right = details["CH-0002"].get("subject_manifest")
-            # Root names differ by scenario; compare only paths underneath each root.
-            if left is None or right is None or [p.split("/", 1)[-1] for p in left] != [p.split("/", 1)[-1] for p in right]:
+            # Root names differ by scenario; compare only paths underneath each root. The online
+            # deletions are excluded because only CH-0001 retains them, as asserted above.
+            retained = {p.split("/", 1)[-1] for p in details["CH-0001"].get("online_deleted_manifest", [])}
+            if left is None or right is None or [
+                p.split("/", 1)[-1] for p in left if p.split("/", 1)[-1] not in retained
+            ] != [p.split("/", 1)[-1] for p in right if p.split("/", 1)[-1] not in retained]:
                 return self.fail_result(self.case_id, self.name, "delta/children relative manifests differ", artifacts, details)
         return self.pass_result(self.case_id, self.name, artifacts, details)
 
