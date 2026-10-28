@@ -122,13 +122,25 @@ class TestCase0016CheckNosyncValidation(MonitorModeTestCaseBase):
         absent_names: list[str],
         details: dict[str, object],
         label: str,
+        preserved_identities: dict[str, tuple[object, object]] | None = None,
     ) -> list[str]:
-        # An item beneath a .nosync boundary is intentionally retained, so its record must
-        # exist and must not be left flagged as absent (syncStatus 'N') after a generated
-        # /delta reconciliation. A record for an item deleted online outside the boundary
-        # must have been removed.
+        # An item beneath a .nosync boundary that still exists online is intentionally retained,
+        # so its record must exist and must not be left flagged as absent (syncStatus 'N') after
+        # a generated /delta reconciliation. A record for an item deleted online outside the
+        # boundary must have been removed.
+        # An item beneath the boundary that was deleted online is no longer present online, so
+        # the final online reconciliation legitimately demotes its syncStatus. Only the record
+        # and its (driveId, id) identity recorded before the deletion are required; syncStatus
+        # is deliberately not inspected for these items.
         failures: list[str] = []
         try:
+            for name, expected_identity in (preserved_identities or {}).items():
+                rows = self._database_rows_by_name(config_dir, name)
+                details[f"{label}_record_{name}"] = rows
+                if len(rows) != 1:
+                    failures.append(f"expected exactly one database record for retained item {name}, found {len(rows)}")
+                elif (rows[0]["driveId"], rows[0]["id"]) != expected_identity:
+                    failures.append(f"database identity of retained item {name} changed: expected {expected_identity}, found {(rows[0]['driveId'], rows[0]['id'])}")
             for name in retained_names:
                 rows = self._database_rows_by_name(config_dir, name)
                 details[f"{label}_record_{name}"] = rows
@@ -955,6 +967,19 @@ class TestCase0016CheckNosyncValidation(MonitorModeTestCaseBase):
         if failures:
             return finish()
 
+        # The identity of the file that is about to be deleted online is recorded before the deletion
+        # (the client has exited, so the database is read through a read-only connection).
+        try:
+            baseline_rows = self._database_rows_by_name(conf_subject, "protected-deleted.txt")
+        except sqlite3.Error as exc:
+            failures.append(f"baseline database could not be read: {exc}")
+            return finish()
+        details["baseline_record_protected-deleted.txt"] = baseline_rows
+        if len(baseline_rows) != 1:
+            failures.append(f"expected exactly one baseline database record for protected-deleted.txt, found {len(baseline_rows)}")
+            return finish()
+        protected_deleted_identity = (baseline_rows[0]["driveId"], baseline_rows[0]["id"])
+
         # Phase 3: the already-tracked directory becomes a .nosync boundary, with local-only content.
         write_text_file(subject_root / nosync_relative, "")
         write_text_file(subject_root / local_only_relative, local_only_content)
@@ -1017,12 +1042,14 @@ class TestCase0016CheckNosyncValidation(MonitorModeTestCaseBase):
         if (subject_root / control_deleted).exists():
             failures.append(f"online deletion outside .nosync was not applied locally: {control_deleted}")
 
-        # The retained object keeps its database identity, flagged as present rather than absent.
+        # The object deleted online beneath the boundary keeps its database record and identity (its
+        # syncStatus is not inspected), while the object still online is flagged as present.
         # The record for the object deleted outside the boundary must have been removed.
         failures.extend(
             self._nosync_record_failures(
                 conf_subject,
-                retained_names=["protected-deleted.txt", "protected-kept.txt"],
+                retained_names=["protected-kept.txt"],
+                preserved_identities={"protected-deleted.txt": protected_deleted_identity},
                 absent_names=["control-deleted.txt"],
                 details=details,
                 label="subject_reconcile",
@@ -1042,6 +1069,19 @@ class TestCase0016CheckNosyncValidation(MonitorModeTestCaseBase):
         for relative in (protected_deleted, protected_kept, local_only_relative, nosync_relative, control_kept):
             if not (subject_root / relative).is_file():
                 failures.append(f"subject convergence run removed an object that must be retained: {relative}")
+        for relative, text in {protected_deleted: contents[protected_deleted], protected_kept: contents[protected_kept]}.items():
+            if self._read_file(subject_root / relative) != text:
+                failures.append(f"subject convergence run changed the content of: {relative}")
+        failures.extend(
+            self._nosync_record_failures(
+                conf_subject,
+                retained_names=["protected-kept.txt"],
+                preserved_identities={"protected-deleted.txt": protected_deleted_identity},
+                absent_names=["control-deleted.txt"],
+                details=details,
+                label="subject_converge",
+            )
+        )
 
         # Phase 8: online truth. The subject must not have uploaded local-only content or restored deletions.
         reset_directory(verify_root)

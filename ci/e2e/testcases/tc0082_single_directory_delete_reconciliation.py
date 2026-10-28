@@ -193,6 +193,10 @@ class TestCase0082SingleDirectoryDeleteReconciliation(E2ETestCase):
             f"{root_name}/Stable/Nested/keep-b.txt": "TC0082 SD-0002 stable nested file\n",
             f"{root_name}/Stable/Nested/Deep/keep-c.txt": "TC0082 SD-0002 stable deep file\n",
         }
+        # A dedicated bulk subtree keeps the online enumeration running long enough for SIGINT to land mid-way.
+        for bulk_dir in range(10):
+            for bulk_index in range(30):
+                stable_files[f"{root_name}/Bulk/Dir{bulk_dir:02d}/file-{bulk_index:03d}.txt"] = f"TC0082 SD-0002 bulk file {bulk_dir}-{bulk_index}\n"
         survivor = f"{root_name}/Mutable/keep-d.txt"
         changed_file = f"{root_name}/Mutable/change-me.txt"
         changed_before = "TC0082 SD-0002 content before the online modification\n"
@@ -208,7 +212,8 @@ class TestCase0082SingleDirectoryDeleteReconciliation(E2ETestCase):
         surviving_files = {**stable_files, survivor: "TC0082 SD-0002 file beside the online deletions\n", changed_file: changed_after}
         expected_final = sorted([
             f"{root_name}/", f"{root_name}/Stable/", f"{root_name}/Stable/Nested/",
-            f"{root_name}/Stable/Nested/Deep/", f"{root_name}/Mutable/", *surviving_files,
+            f"{root_name}/Stable/Nested/Deep/", f"{root_name}/Mutable/", f"{root_name}/Bulk/",
+            *(f"{root_name}/Bulk/Dir{bulk_dir:02d}/" for bulk_dir in range(10)), *surviving_files,
         ])
         expected_initial = sorted([
             *expected_final, preserved_file, *deleted_files, f"{root_name}/Mutable/RemoveTree/",
@@ -343,25 +348,47 @@ class TestCase0082SingleDirectoryDeleteReconciliation(E2ETestCase):
         # reaches, items that still exist online must not be removed. A later full run must
         # recover and complete the reconciliation.
         context.log(f"Executing Test Case {self.case_id} {self.REMOTE_SCENARIO_ID} subject_interrupted: {command_to_string(subject_command)}")
-        with phase_files["subject_interrupted"][0].open("w", encoding="utf-8") as stdout_fp, \
+        interrupt_marker = "Generating a /delta response from the OneDrive API"
+        stdout_path = phase_files["subject_interrupted"][0]
+        process = None
+        marker_seen = False
+        signal_sent = False
+        interrupt_failure: str | None = None
+        with stdout_path.open("w", encoding="utf-8") as stdout_fp, \
                 phase_files["subject_interrupted"][1].open("w", encoding="utf-8") as stderr_fp:
-            process = subprocess.Popen(subject_command, cwd=str(context.repo_root), stdout=stdout_fp, stderr=stderr_fp, text=True)
-            deadline = time.time() + 120
-            interrupted_after_marker = False
-            while time.time() < deadline and process.poll() is None:
-                if "Generating a /delta response from the OneDrive API" in phase_files["subject_interrupted"][0].read_text(encoding="utf-8", errors="replace"):
-                    interrupted_after_marker = True
-                    break
-                time.sleep(0.2)
-            if process.poll() is None:
-                process.send_signal(signal.SIGINT)
-                try:
-                    process.wait(timeout=60)
-                except subprocess.TimeoutExpired:
+            try:
+                process = subprocess.Popen(subject_command, cwd=str(context.repo_root), stdout=stdout_fp, stderr=stderr_fp, text=True)
+                deadline = time.time() + 120
+                while time.time() < deadline and process.poll() is None:
+                    if interrupt_marker in stdout_path.read_text(encoding="utf-8", errors="replace"):
+                        marker_seen = True
+                        break
+                    time.sleep(0.05)
+                if marker_seen and process.poll() is None:
+                    process.send_signal(signal.SIGINT)
+                    signal_sent = True
+                    try:
+                        process.wait(timeout=60)
+                    except subprocess.TimeoutExpired:
+                        interrupt_failure = "the subject did not exit within 60 seconds of SIGINT"
+            finally:
+                # Whatever happened above, no subject process may outlive this step.
+                if process is not None and process.poll() is None:
                     process.kill()
                     process.wait(timeout=60)
-            scenario_details["subject_interrupted_returncode"] = process.returncode
-            scenario_details["subject_interrupted_after_enumeration_started"] = interrupted_after_marker
+        stdout_lines = [line for line in stdout_path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
+        scenario_details["subject_interrupted_returncode"] = process.returncode if process is not None else None
+        scenario_details["subject_interrupted_after_enumeration_started"] = marker_seen
+        scenario_details["subject_interrupted_signal_sent"] = signal_sent
+        scenario_details["subject_interrupted_last_output_line"] = stdout_lines[-1] if stdout_lines else ""
+        if interrupt_failure:
+            return fail(interrupt_failure)
+        if not marker_seen:
+            return fail("the online enumeration start marker was not observed before the subject exited or timed out")
+        if not signal_sent:
+            return fail("the subject finished before SIGINT could be sent, so the interruption was not exercised")
+        if process.returncode not in (130, -signal.SIGINT):
+            return fail(f"the subject was not terminated by SIGINT (exit status {process.returncode}), so it may have completed normally")
         for relative in (*stable_files, survivor):
             path = subject_root / relative
             if not path.is_file() or path.read_text(encoding="utf-8") != surviving_files[relative]:
