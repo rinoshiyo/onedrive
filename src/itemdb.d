@@ -230,6 +230,7 @@ final class ItemDatabase {
 	Database db;
 	string insertItemStmt;
 	string updateItemStmt;
+	string updateItemIfChangedStmt;
 	string deleteOrphanItemStmt;
 	string selectItemByIdStmt;
 	string selectItemByRemoteIdStmt;
@@ -368,19 +369,23 @@ final class ItemDatabase {
 			INSERT OR REPLACE INTO item (driveId, id, name, remoteName, type, eTag, cTag, mtime, parentId, quickXorHash, sha256Hash, remoteDriveId, remoteParentId, remoteId, remoteType, syncStatus, size, relocDriveId, relocParentId)
 			VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
 		";
-		// Only update the record when at least one column value differs from what is already stored.
+		updateItemStmt = "
+			UPDATE item
+			SET name = ?3, remoteName = ?4, type = ?5, eTag = ?6, cTag = ?7, mtime = ?8, parentId = ?9, quickXorHash = ?10, sha256Hash = ?11, remoteDriveId = ?12, remoteParentId = ?13, remoteId = ?14, remoteType = ?15, syncStatus = ?16, size = ?17, relocDriveId = ?18, relocParentId = ?19
+			WHERE driveId = ?1 AND id = ?2
+		";
+		// Variant of updateItemStmt that leaves the record untouched when every stored column already holds the supplied value.
 		// https://github.com/abraunegg/onedrive/issues/3937
 		//
 		// Generated /delta responses (Shared Folders, --single-directory, National Cloud Deployments and
 		// --download-only --cleanup-local-files) upsert every existing item on every pass, even when nothing
-		// has changed online. Without this guard, each of those full-record updates still writes the table row and
-		// maintains the secondary indexes holding that record (name_idx, selectByPath_idx, item_children_idx
-		// and remote_idx), which results in a large volume of database and WAL writes on every pass.
+		// has changed online. An unconditional UPDATE still writes the table row and maintains the secondary indexes
+		// holding that record, which results in a large volume of database and WAL writes on every pass.
 		//
-		// 'IS' is used rather than '=' so that NULL values compare as equal. When every column already
-		// matches, the statement affects no rows and leaves the database pages untouched. The resulting
-		// database state is identical either way, as the skipped update would have written the same values.
-		updateItemStmt = "
+		// 'IS' is used rather than '=' so that NULL values compare as equal. When every column already matches,
+		// the statement affects no rows. This statement is only used where explicitly requested by the caller
+		// (see upsert()), so all other callers keep the unconditional update.
+		updateItemIfChangedStmt = "
 			UPDATE item
 			SET name = ?3, remoteName = ?4, type = ?5, eTag = ?6, cTag = ?7, mtime = ?8, parentId = ?9, quickXorHash = ?10, sha256Hash = ?11, remoteDriveId = ?12, remoteParentId = ?13, remoteId = ?14, remoteType = ?15, syncStatus = ?16, size = ?17, relocDriveId = ?18, relocParentId = ?19
 			WHERE driveId = ?1 AND id = ?2
@@ -607,7 +612,9 @@ final class ItemDatabase {
 		}
 	}
 
-	void upsert(const ref Item item) {
+	// When 'skipIfUnchanged' is true, an existing record is only written when at least one stored column differs from the supplied item
+	// https://github.com/abraunegg/onedrive/issues/3937
+	void upsert(const ref Item item, bool skipIfUnchanged = false) {
 		synchronized(databaseLock) {
 			Statement selectStmt = db.prepare("SELECT COUNT(*) FROM item WHERE driveId = ? AND id = ?");
 			Statement selectParentalStmt = db.prepare("SELECT COUNT(*) FROM item WHERE driveId = ? AND parentId = ? AND name = ?");
@@ -671,7 +678,7 @@ final class ItemDatabase {
 					if (debugLogging) {
 						addLogEntry("Updating existing DB record: id='" ~ item.id ~ "', parentId='" ~ item.parentId ~ "', name='" ~ item.name ~ "'", ["debug"]);
 					}
-					executionStmt = db.prepare(updateItemStmt);
+					executionStmt = db.prepare(skipIfUnchanged ? updateItemIfChangedStmt : updateItemStmt);
 				}
 
 				bindItem(item, executionStmt);
@@ -1376,14 +1383,14 @@ final class ItemDatabase {
 	// https://github.com/abraunegg/onedrive/issues/3937
 	//
 	// When an existing item is seen online during a generated /delta response, flag it as in-sync again.
-	// Only the 'syncStatus' column is written, so the indexed columns of the record are left untouched.
+	// Only the 'syncStatus' column is written, and only when it is not already 'Y', so the indexed columns of the record are left untouched.
 	// Updating the full record here would also maintain every secondary index holding that record, even
 	// though only the presence flag has changed.
 	void upgradeSyncStatusFlag(const(char)[] driveId, const(char)[] id) {
 		synchronized(databaseLock) {
 			assert(driveId);
 
-			auto stmt = db.prepare("UPDATE item SET syncStatus = 'Y' WHERE driveId = ?1 AND id = ?2");
+			auto stmt = db.prepare("UPDATE item SET syncStatus = 'Y' WHERE driveId = ?1 AND id = ?2 AND syncStatus IS NOT 'Y'");
 			scope(exit) {
 				stmt.finalise(); // Ensure that the prepared statement is finalised after execution.
 			}

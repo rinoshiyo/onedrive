@@ -4594,7 +4594,9 @@ class SyncEngine {
 
 				// Add to the local database
 				if (debugLogging) {addLogEntry("Adding changed OneDrive Item to database: " ~ to!string(changedOneDriveItem), ["debug"]);}
-				itemDB.upsert(changedOneDriveItem);
+				// https://github.com/abraunegg/onedrive/issues/3937
+				// A generated /delta response presents every existing item on every pass, so skip the write when the stored record already matches
+				itemDB.upsert(changedOneDriveItem, generatedSimulatedDeltaResponse);
 			}
 		}
 
